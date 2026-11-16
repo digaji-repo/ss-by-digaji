@@ -26,7 +26,9 @@ interface FileState {
   loading: boolean;
   previewFile: FileItem | null;
   editingFile: FileItem | null;
+  wordEditingFile: FileItem | null;
   renamingFile: FileItem | null;
+  fileRevisions: Record<string, number>;
 
   setFiles: (files: FileItem[]) => void;
   setLoading: (loading: boolean) => void;
@@ -35,6 +37,7 @@ interface FileState {
   updateDownloadCount: (fileId: string, downloadCount: number) => void;
   setPreviewFile: (file: FileItem | null) => void;
   setEditingFile: (file: FileItem | null) => void;
+  setWordEditingFile: (file: FileItem | null) => void;
   setRenamingFile: (file: FileItem | null) => void;
 
   addTransfer: (transfer: FileTransferItem) => void;
@@ -50,7 +53,9 @@ export const useFileStore = create<FileState>((set, get) => ({
   loading: false,
   previewFile: null,
   editingFile: null,
+  wordEditingFile: null,
   renamingFile: null,
+  fileRevisions: {},
 
   setFiles: (files) => set({ files }),
   setLoading: (loading) => set({ loading }),
@@ -61,10 +66,13 @@ export const useFileStore = create<FileState>((set, get) => ({
       if (idx >= 0) {
         const next = [...state.files];
         next[idx] = file;
+        const nextRev = (state.fileRevisions[file.id] ?? 0) + 1;
         return {
           files: next,
+          fileRevisions: { ...state.fileRevisions, [file.id]: nextRev },
           previewFile: state.previewFile?.id === file.id ? file : state.previewFile,
           editingFile: state.editingFile?.id === file.id ? file : state.editingFile,
+          wordEditingFile: state.wordEditingFile?.id === file.id ? file : state.wordEditingFile,
           renamingFile: state.renamingFile?.id === file.id ? file : state.renamingFile,
         };
       }
@@ -76,6 +84,7 @@ export const useFileStore = create<FileState>((set, get) => ({
       files: state.files.filter((item) => item.id !== fileId),
       previewFile: state.previewFile?.id === fileId ? null : state.previewFile,
       editingFile: state.editingFile?.id === fileId ? null : state.editingFile,
+      wordEditingFile: state.wordEditingFile?.id === fileId ? null : state.wordEditingFile,
       renamingFile: state.renamingFile?.id === fileId ? null : state.renamingFile,
     })),
 
@@ -88,6 +97,7 @@ export const useFileStore = create<FileState>((set, get) => ({
 
   setPreviewFile: (previewFile) => set({ previewFile }),
   setEditingFile: (editingFile) => set({ editingFile }),
+  setWordEditingFile: (wordEditingFile) => set({ wordEditingFile }),
   setRenamingFile: (renamingFile) => set({ renamingFile }),
 
   addTransfer: (transfer) =>
@@ -139,7 +149,9 @@ export const useFileStore = create<FileState>((set, get) => ({
       loading: false,
       previewFile: null,
       editingFile: null,
+      wordEditingFile: null,
       renamingFile: null,
+      fileRevisions: {},
     });
   },
 }));

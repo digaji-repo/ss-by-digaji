@@ -33,7 +33,11 @@ import { EmptyState, Skeleton } from '@/components/ui/States';
 import type { FileItem } from '@/types/file';
 import { formatRelativeTime } from '@/utils/format-date';
 import { formatBytes } from '@/utils/format-size';
-import { isEditableTextFile, isPreviewableFile } from '@/utils/validators';
+import {
+  isEditableTextFile,
+  isPreviewableFile,
+  isWordDocumentFile,
+} from '@/utils/validators';
 
 export type FileSortOption =
   | 'newest'
@@ -57,6 +61,7 @@ interface FileListProps {
   loading: boolean;
   onPreview: (file: FileItem) => void;
   onEditContent: (file: FileItem) => void;
+  onEditWord?: (file: FileItem) => void;
   onRename: (file: FileItem) => void;
   onCopyLink: (file: FileItem) => void;
   onDownload: (file: FileItem) => void;
@@ -182,6 +187,7 @@ export function FileList({
   loading,
   onPreview,
   onEditContent,
+  onEditWord,
   onRename,
   onCopyLink,
   onDownload,
@@ -415,6 +421,7 @@ export function FileList({
                   const Icon = visual.icon;
                   const previewable = isPreviewableFile(file.mime_type, file.original_name);
                   const editable = isEditableTextFile(file.original_name, file.mime_type);
+                  const editableWord = isWordDocumentFile(file.original_name, file.mime_type);
                   const isSelected = selectedIds.has(file.id);
 
                   return (
@@ -466,6 +473,15 @@ export function FileList({
                             <FileCode2 size={15} strokeWidth={1.9} />
                           </IconButton>
                         )}
+                        {editableWord && onEditWord && (
+                          <IconButton
+                            label="Edit Dokumen Word"
+                            size="sm"
+                            onClick={() => onEditWord(file)}
+                          >
+                            <FileText size={15} strokeWidth={1.9} />
+                          </IconButton>
+                        )}
                         <IconButton label="Ubah Nama File" size="sm" onClick={() => onRename(file)}>
                           <Pencil size={15} strokeWidth={1.9} />
                         </IconButton>
@@ -504,9 +520,20 @@ export function FileList({
                   const Icon = visual.icon;
                   const previewable = isPreviewableFile(file.mime_type, file.original_name);
                   const editable = isEditableTextFile(file.original_name, file.mime_type);
+                  const editableWord = isWordDocumentFile(file.original_name, file.mime_type);
                   const isSelected = selectedIds.has(file.id);
 
                   const menuItems = [
+                    ...(editableWord && onEditWord
+                      ? [
+                          {
+                            id: 'edit-word',
+                            label: 'Edit Dokumen Word',
+                            icon: <FileText size={14} strokeWidth={1.9} />,
+                            onClick: () => onEditWord(file),
+                          },
+                        ]
+                      : []),
                     ...(editable
                       ? [
                           {
@@ -605,6 +632,15 @@ export function FileList({
                               onClick={() => onEditContent(file)}
                             >
                               <FileCode2 size={15} strokeWidth={1.9} />
+                            </IconButton>
+                          )}
+                          {editableWord && onEditWord && (
+                            <IconButton
+                              label="Edit Dokumen Word"
+                              size="sm"
+                              onClick={() => onEditWord(file)}
+                            >
+                              <FileText size={15} strokeWidth={1.9} />
                             </IconButton>
                           )}
                           <IconButton

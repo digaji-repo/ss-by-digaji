@@ -14,9 +14,9 @@ import (
 )
 
 var (
-	ErrFileTooLarge  = errors.New("file exceeds maximum allowed size")
-	ErrInvalidPath   = errors.New("invalid storage path")
-	ErrMissingChunk  = errors.New("one or more upload chunks are missing")
+	ErrFileTooLarge = errors.New("file exceeds maximum allowed size")
+	ErrInvalidPath  = errors.New("invalid storage path")
+	ErrMissingChunk = errors.New("one or more upload chunks are missing")
 )
 
 // LocalStorage saves uploaded files outside any public web directory under StorageRoot.
@@ -24,17 +24,21 @@ type LocalStorage struct {
 	rootAbs string
 }
 
-// NewLocalStorage initializes local isolated directories under rootDir.
+// NewLocalStorage initializes isolated main, temp chunk, and quarantine directories under rootDir.
 func NewLocalStorage(rootDir string) (*LocalStorage, error) {
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage root: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(abs, "rooms"), 0o750); err != nil {
-		return nil, fmt.Errorf("create rooms storage dir: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(abs, "tmp", "chunks"), 0o750); err != nil {
-		return nil, fmt.Errorf("create temp chunks dir: %w", err)
+	for _, sub := range [][]string{
+		{"rooms"},
+		{"tmp", "chunks"},
+		{"quarantine", "pending"},
+		{"quarantine", "infected"},
+	} {
+		if err := os.MkdirAll(filepath.Join(append([]string{abs}, sub...)...), 0o750); err != nil {
+			return nil, fmt.Errorf("create storage subdir %v: %w", sub, err)
+		}
 	}
 	return &LocalStorage{rootAbs: abs}, nil
 }
@@ -49,34 +53,18 @@ func (l *LocalStorage) safeJoin(relParts ...string) (string, error) {
 	return clean, nil
 }
 
-// SaveStream streams r directly to disk without buffering the entire file in memory.
-func (l *LocalStorage) SaveStream(roomID, storedName string, r io.Reader, maxBytes int64) (*SavedStreamResult, error) {
-	if _, err := uuid.Parse(roomID); err != nil {
-		return nil, ErrInvalidPath
-	}
-	roomDir, err := l.safeJoin("rooms", roomID)
+// writeLimitedStream streams r directly to destAbs while capping bytes and capturing the 512-byte signature header.
+func writeLimitedStream(destAbs string, r io.Reader, maxBytes int64) (int64, []byte, error) {
+	f, err := os.OpenFile(destAbs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(roomDir, 0o750); err != nil {
-		return nil, err
-	}
-
-	destPath, err := l.safeJoin("rooms", roomID, filepath.Base(storedName))
-	if err != nil {
-		return nil, err
-	}
-
-	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
-	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
 	cleanupOnError := true
 	defer func() {
 		_ = f.Close()
 		if cleanupOnError {
-			_ = os.Remove(destPath)
+			_ = os.Remove(destAbs)
 		}
 	}()
 
@@ -90,7 +78,7 @@ func (l *LocalStorage) SaveStream(roomID, storedName string, r io.Reader, maxByt
 		if n > 0 {
 			written += int64(n)
 			if written > maxBytes {
-				return nil, ErrFileTooLarge
+				return 0, nil, ErrFileTooLarge
 			}
 			if len(headerBuf) < 512 {
 				need := 512 - len(headerBuf)
@@ -100,19 +88,168 @@ func (l *LocalStorage) SaveStream(roomID, storedName string, r io.Reader, maxByt
 				headerBuf = append(headerBuf, buf[:need]...)
 			}
 			if _, writeErr := f.Write(buf[:n]); writeErr != nil {
-				return nil, writeErr
+				return 0, nil, writeErr
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return nil, readErr
+			return 0, nil, readErr
 		}
 	}
 
 	cleanupOnError = false
-	relPath := filepath.ToSlash(filepath.Join("rooms", roomID, filepath.Base(storedName)))
+	return written, headerBuf, nil
+}
+
+// SaveQuarantineStream writes an incoming upload stream into isolated pending quarantine for scanning before release.
+func (l *LocalStorage) SaveQuarantineStream(r io.Reader, maxBytes int64) (*QuarantineFile, error) {
+	id := uuid.NewString()
+	pendingDir, err := l.safeJoin("quarantine", "pending")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(pendingDir, 0o750); err != nil {
+		return nil, err
+	}
+	destAbs, err := l.safeJoin("quarantine", "pending", id+".tmp")
+	if err != nil {
+		return nil, err
+	}
+
+	written, header, err := writeLimitedStream(destAbs, r, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &QuarantineFile{
+		ID:          id,
+		AbsPath:     destAbs,
+		Size:        written,
+		HeaderBytes: header,
+	}, nil
+}
+
+// PromoteQuarantine moves a verified quarantine file into a room's isolated directory under a random filename.
+func (l *LocalStorage) PromoteQuarantine(q *QuarantineFile, roomID, storedName string) (*SavedStreamResult, error) {
+	if q == nil {
+		return nil, ErrInvalidPath
+	}
+	if _, err := uuid.Parse(roomID); err != nil {
+		return nil, ErrInvalidPath
+	}
+	roomDir, err := l.safeJoin("rooms", roomID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(roomDir, 0o750); err != nil {
+		return nil, err
+	}
+
+	safeName := filepath.Base(storedName)
+	destAbs, err := l.safeJoin("rooms", roomID, safeName)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := moveFile(q.AbsPath, destAbs, 0o640); err != nil {
+		return nil, err
+	}
+
+	relPath := filepath.ToSlash(filepath.Join("rooms", roomID, safeName))
+	return &SavedStreamResult{
+		StoragePath: relPath,
+		Size:        q.Size,
+		HeaderBytes: q.HeaderBytes,
+	}, nil
+}
+
+// QuarantineInfected isolates a malware-flagged file into quarantine/infected/ with restrictive non-executable permissions.
+func (l *LocalStorage) QuarantineInfected(q *QuarantineFile, _ string) error {
+	if q == nil {
+		return nil
+	}
+	infectedDir, err := l.safeJoin("quarantine", "infected")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(infectedDir, 0o750); err != nil {
+		return err
+	}
+	destAbs, err := l.safeJoin("quarantine", "infected", q.ID+".infected")
+	if err != nil {
+		return err
+	}
+	return moveFile(q.AbsPath, destAbs, 0o600)
+}
+
+// DeleteQuarantine deletes an unverified quarantine file immediately.
+func (l *LocalStorage) DeleteQuarantine(q *QuarantineFile) error {
+	if q == nil || q.AbsPath == "" {
+		return nil
+	}
+	err := os.Remove(q.AbsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func moveFile(srcAbs, dstAbs string, mode os.FileMode) error {
+	if err := os.Rename(srcAbs, dstAbs); err == nil {
+		_ = os.Chmod(dstAbs, mode)
+		return nil
+	}
+	src, err := os.Open(srcAbs)
+	if err != nil {
+		return err
+	}
+	dst, err := os.OpenFile(dstAbs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		_ = src.Close()
+		return err
+	}
+	_, copyErr := io.Copy(dst, src)
+	_ = src.Close()
+	closeErr := dst.Close()
+	if copyErr != nil {
+		_ = os.Remove(dstAbs)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(dstAbs)
+		return closeErr
+	}
+	_ = os.Remove(srcAbs)
+	return nil
+}
+
+// SaveStream streams r directly to room storage (retained for Backend compatibility).
+func (l *LocalStorage) SaveStream(roomID, storedName string, r io.Reader, maxBytes int64) (*SavedStreamResult, error) {
+	if _, err := uuid.Parse(roomID); err != nil {
+		return nil, ErrInvalidPath
+	}
+	roomDir, err := l.safeJoin("rooms", roomID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(roomDir, 0o750); err != nil {
+		return nil, err
+	}
+
+	safeName := filepath.Base(storedName)
+	destPath, err := l.safeJoin("rooms", roomID, safeName)
+	if err != nil {
+		return nil, err
+	}
+
+	written, headerBuf, err := writeLimitedStream(destPath, r, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(destPath, 0o640)
+
+	relPath := filepath.ToSlash(filepath.Join("rooms", roomID, safeName))
 	return &SavedStreamResult{
 		StoragePath: relPath,
 		Size:        written,
@@ -206,7 +343,7 @@ func (l *LocalStorage) WriteChunk(uploadID string, index int, r io.Reader, maxCh
 		return 0, err
 	}
 
-	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return 0, err
 	}
@@ -254,28 +391,26 @@ func (l *LocalStorage) ListChunkIndices(uploadID string) ([]int, error) {
 	return indices, nil
 }
 
-// AssembleChunks streams all chunk parts sequentially into the room's isolated destination file.
-func (l *LocalStorage) AssembleChunks(roomID, uploadID, storedName string, totalChunks int, maxBytes int64) (*SavedStreamResult, error) {
-	if _, err := uuid.Parse(roomID); err != nil {
-		return nil, ErrInvalidPath
-	}
+// AssembleChunksToQuarantine sequentially merges chunks into pending quarantine for verification and scanning.
+func (l *LocalStorage) AssembleChunksToQuarantine(uploadID string, totalChunks int, maxBytes int64) (*QuarantineFile, error) {
 	if _, err := uuid.Parse(uploadID); err != nil {
 		return nil, ErrInvalidPath
 	}
-	roomDir, err := l.safeJoin("rooms", roomID)
+	pendingDir, err := l.safeJoin("quarantine", "pending")
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(roomDir, 0o750); err != nil {
+	if err := os.MkdirAll(pendingDir, 0o750); err != nil {
 		return nil, err
 	}
 
-	destPath, err := l.safeJoin("rooms", roomID, filepath.Base(storedName))
+	id := uuid.NewString()
+	destAbs, err := l.safeJoin("quarantine", "pending", id+".tmp")
 	if err != nil {
 		return nil, err
 	}
 
-	dest, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	dest, err := os.OpenFile(destAbs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +419,7 @@ func (l *LocalStorage) AssembleChunks(roomID, uploadID, storedName string, total
 	defer func() {
 		_ = dest.Close()
 		if cleanupOnError {
-			_ = os.Remove(destPath)
+			_ = os.Remove(destAbs)
 		}
 	}()
 
@@ -339,12 +474,26 @@ func (l *LocalStorage) AssembleChunks(roomID, uploadID, storedName string, total
 	cleanupOnError = false
 	_ = l.DeleteUploadTemp(uploadID)
 
-	relPath := filepath.ToSlash(filepath.Join("rooms", roomID, filepath.Base(storedName)))
-	return &SavedStreamResult{
-		StoragePath: relPath,
+	return &QuarantineFile{
+		ID:          id,
+		AbsPath:     destAbs,
 		Size:        totalWritten,
 		HeaderBytes: headerBuf,
 	}, nil
+}
+
+// AssembleChunks assembles chunk parts via quarantine into destination room directory.
+func (l *LocalStorage) AssembleChunks(roomID, uploadID, storedName string, totalChunks int, maxBytes int64) (*SavedStreamResult, error) {
+	q, err := l.AssembleChunksToQuarantine(uploadID, totalChunks, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	res, err := l.PromoteQuarantine(q, roomID, storedName)
+	if err != nil {
+		_ = l.DeleteQuarantine(q)
+		return nil, err
+	}
+	return res, nil
 }
 
 // DeleteUploadTemp removes temporary chunk directories.
@@ -359,30 +508,38 @@ func (l *LocalStorage) DeleteUploadTemp(uploadID string) error {
 	return os.RemoveAll(dir)
 }
 
-// CleanupStaleChunks removes orphaned chunk temp folders older than maxAgeSeconds.
+// CleanupStaleChunks removes orphaned temp chunk folders and expired quarantine staging files.
 func (l *LocalStorage) CleanupStaleChunks(maxAgeSeconds int64) error {
-	baseDir, err := l.safeJoin("tmp", "chunks")
-	if err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(baseDir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
 	cutoff := time.Now().Add(-time.Duration(maxAgeSeconds) * time.Second)
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+
+	baseDir, err := l.safeJoin("tmp", "chunks")
+	if err == nil {
+		if entries, readErr := os.ReadDir(baseDir); readErr == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				if info, infoErr := entry.Info(); infoErr == nil && info.ModTime().Before(cutoff) {
+					_ = os.RemoveAll(filepath.Join(baseDir, entry.Name()))
+				}
+			}
 		}
-		info, err := entry.Info()
+	}
+
+	for _, qSub := range [][]string{{"quarantine", "pending"}, {"quarantine", "infected"}} {
+		qDir, err := l.safeJoin(qSub...)
 		if err != nil {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
-			_ = os.RemoveAll(filepath.Join(baseDir, entry.Name()))
+		if entries, readErr := os.ReadDir(qDir); readErr == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				if info, infoErr := entry.Info(); infoErr == nil && info.ModTime().Before(cutoff) {
+					_ = os.Remove(filepath.Join(qDir, entry.Name()))
+				}
+			}
 		}
 	}
 	return nil

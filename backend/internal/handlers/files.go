@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -29,16 +31,82 @@ var errRoomExpiredTx = errors.New("room expired during upload")
 
 // FileHandler handles streaming uploads, chunked resumable uploads, streaming downloads, previews, and deletion.
 type FileHandler struct {
-	db      *sql.DB
-	cache   *cache.Client
-	storage storage.Backend
-	hub     *realtime.Hub
-	cfg     *config.Config
+	db        *sql.DB
+	cache     *cache.Client
+	storage   storage.Backend
+	hub       *realtime.Hub
+	cfg       *config.Config
+	scanner   security.MalwareScanner
+	forceScan bool
 }
 
-// NewFileHandler constructs FileHandler.
+// NewFileHandler constructs FileHandler with optional ClamAV scanner enabled via config.
 func NewFileHandler(db *sql.DB, cacheClient *cache.Client, store storage.Backend, hub *realtime.Hub, cfg *config.Config) *FileHandler {
-	return &FileHandler{db: db, cache: cacheClient, storage: store, hub: hub, cfg: cfg}
+	var scanner security.MalwareScanner
+	if cfg != nil && cfg.ClamAVEnabled {
+		scanner = security.NewClamAVScanner(cfg.ClamAVAddr, cfg.ClamAVTimeout)
+	}
+	return &FileHandler{
+		db:      db,
+		cache:   cacheClient,
+		storage: store,
+		hub:     hub,
+		cfg:     cfg,
+		scanner: scanner,
+	}
+}
+
+// SetMalwareScanner injects a custom MalwareScanner (e.g., in integration tests) and enforces scanning.
+func (h *FileHandler) SetMalwareScanner(s security.MalwareScanner) {
+	h.scanner = s
+	h.forceScan = s != nil
+}
+
+// inspectQuarantinedFile validates extension/signature, OOXML archive safety, and ClamAV malware signatures before file release.
+func (h *FileHandler) inspectQuarantinedFile(
+	ctx context.Context,
+	q *storage.QuarantineFile,
+	origName string,
+	declaredMIME string,
+) (detectedMIME string, httpStatus int, errCode string, errMsg string) {
+	detected, err := security.ValidateExtensionAndDetectMIME(origName, q.HeaderBytes, declaredMIME)
+	if err != nil {
+		_ = h.storage.DeleteQuarantine(q)
+		if errors.Is(err, security.ErrInvalidSignature) {
+			return "", http.StatusBadRequest, "invalid_signature", err.Error()
+		}
+		return "", http.StatusBadRequest, "blocked_file_type", err.Error()
+	}
+
+	if security.IsWordDocumentFile(origName, detected) {
+		maxUncompressed := int64(30 * 1024 * 1024)
+		if h.cfg != nil && h.cfg.MaxDocxUncompressedBytes > 0 {
+			maxUncompressed = h.cfg.MaxDocxUncompressedBytes
+		}
+		if err := security.InspectOOXMLArchive(q.AbsPath, maxUncompressed, true); err != nil {
+			_ = h.storage.DeleteQuarantine(q)
+			if errors.Is(err, security.ErrZipBombDetected) {
+				return "", http.StatusUnprocessableEntity, "zip_bomb_detected", err.Error()
+			}
+			return "", http.StatusBadRequest, "invalid_docx", err.Error()
+		}
+	}
+
+	if h.scanner != nil && (h.forceScan || (h.cfg != nil && h.cfg.ClamAVEnabled)) {
+		if scanErr := h.scanner.ScanFile(ctx, q.AbsPath); scanErr != nil {
+			if errors.Is(scanErr, security.ErrMalwareDetected) {
+				_ = h.storage.QuarantineInfected(q, scanErr.Error())
+				log.Printf("[SECURITY] Malware quarantined: file=%q quarantine=%s reason=%v", origName, q.ID, scanErr)
+				return "", http.StatusUnprocessableEntity, "malware_detected", "File rejected: malware detected and isolated in quarantine."
+			}
+			if h.cfg == nil || !h.cfg.ClamAVFailOpen {
+				_ = h.storage.DeleteQuarantine(q)
+				return "", http.StatusServiceUnavailable, "scanner_unavailable", "Malware scanner is temporarily unavailable. Upload rejected."
+			}
+		}
+	}
+
+	return detected, 0, "", ""
 }
 
 // UploadFiles handles streaming multipart upload via POST /api/rooms/{code}/files.
@@ -111,22 +179,28 @@ func (h *FileHandler) UploadFiles(w http.ResponseWriter, r *http.Request) {
 			Timestamp: time.Now().UTC(),
 		})
 
-		storedName := uuid.NewString() + "_" + origName
-		res, err := h.storage.SaveStream(room.ID, storedName, part, maxAllowed)
+		qFile, err := h.storage.SaveQuarantineStream(part, maxAllowed)
 		_ = part.Close()
 		if err != nil {
 			if errors.Is(err, storage.ErrFileTooLarge) {
 				middleware.WriteError(w, http.StatusRequestEntityTooLarge, "file_too_large", "File exceeds maximum allowed size or remaining room storage.")
 				return
 			}
-			middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to save uploaded file.")
+			middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to save uploaded file to quarantine.")
 			return
 		}
 
-		detectedMime, err := security.ValidateExtensionAndDetectMIME(origName, res.HeaderBytes, part.Header.Get("Content-Type"))
+		detectedMime, status, code, msg := h.inspectQuarantinedFile(r.Context(), qFile, origName, part.Header.Get("Content-Type"))
+		if status != 0 {
+			middleware.WriteError(w, status, code, msg)
+			return
+		}
+
+		storedName := uuid.NewString() + ".bin"
+		res, err := h.storage.PromoteQuarantine(qFile, room.ID, storedName)
 		if err != nil {
-			_ = h.storage.Delete(res.StoragePath)
-			middleware.WriteError(w, http.StatusBadRequest, "blocked_file_type", err.Error())
+			_ = h.storage.DeleteQuarantine(qFile)
+			middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to promote verified file.")
 			return
 		}
 
@@ -374,8 +448,7 @@ func (h *FileHandler) CompleteChunkedUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	storedName := uuid.NewString() + "_" + sess.FileName
-	res, err := h.storage.AssembleChunks(room.ID, uploadID, storedName, sess.TotalChunks, h.cfg.MaxFileSizeBytes)
+	qFile, err := h.storage.AssembleChunksToQuarantine(uploadID, sess.TotalChunks, h.cfg.MaxFileSizeBytes)
 	if err != nil {
 		if errors.Is(err, storage.ErrMissingChunk) {
 			middleware.WriteError(w, http.StatusBadRequest, "missing_chunks", err.Error())
@@ -385,14 +458,21 @@ func (h *FileHandler) CompleteChunkedUpload(w http.ResponseWriter, r *http.Reque
 			middleware.WriteError(w, http.StatusRequestEntityTooLarge, "file_too_large", err.Error())
 			return
 		}
-		middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to assemble uploaded chunks.")
+		middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to assemble uploaded chunks into quarantine.")
 		return
 	}
 
-	detectedMime, err := security.ValidateExtensionAndDetectMIME(sess.FileName, res.HeaderBytes, sess.ContentType)
+	detectedMime, status, code, msg := h.inspectQuarantinedFile(r.Context(), qFile, sess.FileName, sess.ContentType)
+	if status != 0 {
+		middleware.WriteError(w, status, code, msg)
+		return
+	}
+
+	storedName := uuid.NewString() + ".bin"
+	res, err := h.storage.PromoteQuarantine(qFile, room.ID, storedName)
 	if err != nil {
-		_ = h.storage.Delete(res.StoragePath)
-		middleware.WriteError(w, http.StatusBadRequest, "blocked_file_type", err.Error())
+		_ = h.storage.DeleteQuarantine(qFile)
+		middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to promote verified chunked file.")
 		return
 	}
 
@@ -599,7 +679,71 @@ func (h *FileHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, strings.ReplaceAll(fileRec.OriginalName, `"`, `'`), encodedName))
 
-	http.ServeContent(w, r, fileRec.OriginalName, stat.ModTime(), f)
+	outWriter := wrapBandwidthLimitedWriter(w, r.Context(), h.cfg.DownloadBandwidthKBps)
+	http.ServeContent(outWriter, r, fileRec.OriginalName, stat.ModTime(), f)
+}
+
+type bandwidthResponseWriter struct {
+	http.ResponseWriter
+	ctx         context.Context
+	bytesPerSec int64
+	tokens      int64
+	lastRefill  time.Time
+}
+
+func wrapBandwidthLimitedWriter(w http.ResponseWriter, ctx context.Context, kbps int64) http.ResponseWriter {
+	if kbps <= 0 {
+		return w
+	}
+	bps := kbps * 1024
+	return &bandwidthResponseWriter{
+		ResponseWriter: w,
+		ctx:            ctx,
+		bytesPerSec:    bps,
+		tokens:         64 * 1024,
+		lastRefill:     time.Now(),
+	}
+}
+
+func (bw *bandwidthResponseWriter) Write(p []byte) (int, error) {
+	total := 0
+	const chunkCap = 32 * 1024
+	for total < len(p) {
+		end := total + chunkCap
+		if end > len(p) {
+			end = len(p)
+		}
+		need := int64(end - total)
+		now := time.Now()
+		elapsed := now.Sub(bw.lastRefill).Seconds()
+		if elapsed > 0 {
+			bw.tokens += int64(elapsed * float64(bw.bytesPerSec))
+			maxBurst := int64(64 * 1024)
+			if bw.tokens > maxBurst {
+				bw.tokens = maxBurst
+			}
+			bw.lastRefill = now
+		}
+		if bw.tokens < need {
+			waitSec := float64(need-bw.tokens) / float64(bw.bytesPerSec)
+			timer := time.NewTimer(time.Duration(waitSec * float64(time.Second)))
+			select {
+			case <-bw.ctx.Done():
+				timer.Stop()
+				return total, bw.ctx.Err()
+			case <-timer.C:
+			}
+			bw.tokens = need
+			bw.lastRefill = time.Now()
+		}
+		bw.tokens -= need
+		n, err := bw.ResponseWriter.Write(p[total:end])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 // PreviewFile handles GET /api/files/{id}/preview safely inline with CSP sandbox headers.
@@ -610,8 +754,13 @@ func (h *FileHandler) PreviewFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	isEditable := security.IsEditableTextFile(fileRec.OriginalName, fileRec.MimeType)
-	if !security.IsPreviewableMIME(fileRec.MimeType) && !isEditable {
+	isWord := security.IsWordDocumentFile(fileRec.OriginalName, fileRec.MimeType)
+	if !security.IsPreviewableMIME(fileRec.MimeType) && !isEditable && !isWord {
 		middleware.WriteError(w, http.StatusUnsupportedMediaType, "preview_unsupported", "Preview is not supported for this file type.")
+		return
+	}
+	if h.cfg != nil && h.cfg.MaxPreviewBytes > 0 && fileRec.FileSize > h.cfg.MaxPreviewBytes {
+		middleware.WriteError(w, http.StatusRequestEntityTooLarge, "preview_too_large", "File is too large for safe inline preview. Please download instead.")
 		return
 	}
 
@@ -631,8 +780,13 @@ func (h *FileHandler) PreviewFile(w http.ResponseWriter, r *http.Request) {
 	contentType := fileRec.MimeType
 	if isEditable && !strings.HasPrefix(contentType, "text/") && contentType != "application/json" {
 		contentType = "text/plain; charset=utf-8"
+	} else if isWord {
+		contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	}
 
+	if isEditable || isWord {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox")
@@ -728,36 +882,9 @@ type updateFileContentRequest struct {
 	Content string `json:"content"`
 }
 
-// UpdateFileContent handles PUT /api/files/{id}/content for editing text, markdown, and code files.
-func (h *FileHandler) UpdateFileContent(w http.ResponseWriter, r *http.Request) {
-	fileRec, room, ok := h.resolveAuthorizedFile(w, r)
-	if !ok {
-		return
-	}
-
-	if !security.IsEditableTextFile(fileRec.OriginalName, fileRec.MimeType) {
-		middleware.WriteError(w, http.StatusUnsupportedMediaType, "not_editable", "Only text, markdown, and source code files can be edited.")
-		return
-	}
-
-	maxEditBytes := int64(5 * 1024 * 1024)
-	if h.cfg.MaxFileSizeBytes < maxEditBytes {
-		maxEditBytes = h.cfg.MaxFileSizeBytes
-	}
-
-	var req updateFileContentRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxEditBytes+16*1024)).Decode(&req); err != nil {
-		middleware.WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid or oversized file content payload.")
-		return
-	}
-
-	newBytes := []byte(req.Content)
+// overwriteFileBytesAndPublish atomically verifies room quota, overwrites stored bytes, records an edit event, and broadcasts file.updated.
+func (h *FileHandler) overwriteFileBytesAndPublish(w http.ResponseWriter, r *http.Request, fileRec *models.FileRecord, room *models.Room, newBytes []byte, action string) {
 	newSize := int64(len(newBytes))
-	if newSize > maxEditBytes {
-		middleware.WriteError(w, http.StatusRequestEntityTooLarge, "file_too_large", "Edited content exceeds maximum allowed size.")
-		return
-	}
-
 	now := time.Now().UTC()
 	tx, err := h.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -804,7 +931,7 @@ func (h *FileHandler) UpdateFileContent(w http.ResponseWriter, r *http.Request) 
 		"file_id":       fileRec.ID,
 		"original_name": fileRec.OriginalName,
 		"file_size":     newSize,
-		"action":        "edited",
+		"action":        action,
 	})
 	_, _ = tx.ExecContext(r.Context(), `
 		INSERT INTO room_events (id, room_id, event_type, metadata, created_at)
@@ -827,6 +954,99 @@ func (h *FileHandler) UpdateFileContent(w http.ResponseWriter, r *http.Request) 
 	})
 
 	middleware.WriteJSON(w, http.StatusOK, fileRec)
+}
+
+// UpdateFileContent handles PUT /api/files/{id}/content for editing text, markdown, and code files.
+func (h *FileHandler) UpdateFileContent(w http.ResponseWriter, r *http.Request) {
+	fileRec, room, ok := h.resolveAuthorizedFile(w, r)
+	if !ok {
+		return
+	}
+
+	if !security.IsEditableTextFile(fileRec.OriginalName, fileRec.MimeType) {
+		middleware.WriteError(w, http.StatusUnsupportedMediaType, "not_editable", "Only text, markdown, and source code files can be edited.")
+		return
+	}
+
+	maxEditBytes := int64(5 * 1024 * 1024)
+	if h.cfg.MaxFileSizeBytes < maxEditBytes {
+		maxEditBytes = h.cfg.MaxFileSizeBytes
+	}
+
+	var req updateFileContentRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxEditBytes+16*1024)).Decode(&req); err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "invalid_json", "Invalid or oversized file content payload.")
+		return
+	}
+
+	newBytes := []byte(req.Content)
+	if int64(len(newBytes)) > maxEditBytes {
+		middleware.WriteError(w, http.StatusRequestEntityTooLarge, "file_too_large", "Edited content exceeds maximum allowed size.")
+		return
+	}
+
+	h.overwriteFileBytesAndPublish(w, r, fileRec, room, newBytes, "edited")
+}
+
+// UpdateWordBinary handles PUT /api/files/{id}/binary for saving updated OOXML (.docx) Word documents.
+func (h *FileHandler) UpdateWordBinary(w http.ResponseWriter, r *http.Request) {
+	fileRec, room, ok := h.resolveAuthorizedFile(w, r)
+	if !ok {
+		return
+	}
+
+	if !security.IsWordDocumentFile(fileRec.OriginalName, fileRec.MimeType) {
+		middleware.WriteError(w, http.StatusUnsupportedMediaType, "not_editable", "Only .docx Word documents can be updated via this endpoint.")
+		return
+	}
+
+	maxWordBytes := int64(25 * 1024 * 1024)
+	if h.cfg.MaxFileSizeBytes < maxWordBytes {
+		maxWordBytes = h.cfg.MaxFileSizeBytes
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxWordBytes+64*1024)
+	if err := r.ParseMultipartForm(4 * 1024 * 1024); err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "invalid_multipart", "Invalid or oversized Word document payload.")
+		return
+	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+
+	src, _, err := r.FormFile("file")
+	if err != nil {
+		middleware.WriteError(w, http.StatusBadRequest, "missing_file", "Word document file part is required.")
+		return
+	}
+	defer src.Close()
+
+	qFile, err := h.storage.SaveQuarantineStream(src, maxWordBytes)
+	if err != nil {
+		if errors.Is(err, storage.ErrFileTooLarge) {
+			middleware.WriteError(w, http.StatusRequestEntityTooLarge, "file_too_large", "Word document exceeds maximum editable size.")
+			return
+		}
+		middleware.WriteError(w, http.StatusInternalServerError, "storage_error", "Failed to stage Word document.")
+		return
+	}
+
+	_, status, code, msg := h.inspectQuarantinedFile(r.Context(), qFile, fileRec.OriginalName, fileRec.MimeType)
+	if status != 0 {
+		middleware.WriteError(w, status, code, msg)
+		return
+	}
+
+	newBytes, err := os.ReadFile(qFile.AbsPath)
+	_ = h.storage.DeleteQuarantine(qFile)
+	if err != nil {
+		middleware.WriteError(w, http.StatusInternalServerError, "read_error", "Failed to read verified Word document.")
+		return
+	}
+
+	h.overwriteFileBytesAndPublish(w, r, fileRec, room, newBytes, "edited")
 }
 
 // DeleteFile handles DELETE /api/files/{id}.

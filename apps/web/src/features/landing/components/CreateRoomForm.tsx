@@ -89,7 +89,7 @@ export function CreateRoomForm() {
           setAvailability('available');
         }
       }
-    }, 220);
+    }, 450);
 
     return () => {
       cancelled = true;

@@ -1,12 +1,13 @@
-import { useRef } from 'react';
-import { CloudUpload, Code, Folder } from 'lucide-react';
+import { Suspense, lazy, useRef, useState } from 'react';
+import { CloudUpload, Code, FilePlus2, Folder } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { useUpload } from '@/hooks/useUpload';
-import { api } from '@/services/api';
+import { ApiError, api } from '@/services/api';
 import { useFileStore } from '@/stores/file.store';
 import { useRoomStore } from '@/stores/room.store';
 import { useUIStore } from '@/stores/ui.store';
 import type { FileItem } from '@/types/file';
+import { CreateWordModal } from './components/CreateWordModal';
 import { FileEditorModal } from './components/FileEditorModal';
 import { FileList } from './components/FileList';
 import { FilePreviewModal } from './components/FilePreviewModal';
@@ -14,18 +15,24 @@ import { FileUploadZone } from './components/FileUploadZone';
 import { RenameFileModal } from './components/RenameFileModal';
 import { TransferQueue } from './components/TransferQueue';
 
+const LazyWordEditorModal = lazy(() => import('./components/WordEditorModal'));
+
 export function FilesFeature() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [createWordOpen, setCreateWordOpen] = useState(false);
 
   const room = useRoomStore((s) => s.room);
   const files = useFileStore((s) => s.files);
   const loading = useFileStore((s) => s.loading);
   const previewFile = useFileStore((s) => s.previewFile);
   const editingFile = useFileStore((s) => s.editingFile);
+  const wordEditingFile = useFileStore((s) => s.wordEditingFile);
   const renamingFile = useFileStore((s) => s.renamingFile);
   const setPreviewFile = useFileStore((s) => s.setPreviewFile);
   const setEditingFile = useFileStore((s) => s.setEditingFile);
+  const setWordEditingFile = useFileStore((s) => s.setWordEditingFile);
   const setRenamingFile = useFileStore((s) => s.setRenamingFile);
+  const upsertFile = useFileStore((s) => s.upsertFile);
   const removeFile = useFileStore((s) => s.removeFile);
 
   const setActiveTab = useUIStore((s) => s.setActiveTab);
@@ -112,7 +119,7 @@ export function FilesFeature() {
           </div>
         </div>
 
-        <div className="flex items-center gap-2 w-full sm:w-auto">
+        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
           <Button
             variant="primary"
             size="sm"
@@ -121,6 +128,15 @@ export function FilesFeature() {
             className="flex-1 sm:flex-initial"
           >
             Upload File
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={<FilePlus2 size={15} strokeWidth={2} />}
+            onClick={() => setCreateWordOpen(true)}
+            className="flex-1 sm:flex-initial"
+          >
+            Buat Word
           </Button>
           <Button
             variant="secondary"
@@ -153,6 +169,7 @@ export function FilesFeature() {
         loading={loading}
         onPreview={setPreviewFile}
         onEditContent={setEditingFile}
+        onEditWord={setWordEditingFile}
         onRename={setRenamingFile}
         onCopyLink={handleCopyDownloadLink}
         onDownload={startDownload}
@@ -166,12 +183,43 @@ export function FilesFeature() {
         onClose={() => setPreviewFile(null)}
         onDownload={startDownload}
         onEditContent={setEditingFile}
+        onEditWord={setWordEditingFile}
       />
 
       <FileEditorModal
         file={editingFile}
         roomCode={room.room_code}
         onClose={() => setEditingFile(null)}
+      />
+
+      {wordEditingFile && (
+        <Suspense fallback={null}>
+          <LazyWordEditorModal
+            file={wordEditingFile}
+            roomCode={room.room_code}
+            onClose={() => setWordEditingFile(null)}
+          />
+        </Suspense>
+      )}
+
+      <CreateWordModal
+        open={createWordOpen}
+        onClose={() => setCreateWordOpen(false)}
+        onCreate={async (docFile) => {
+          try {
+            const created = await api.uploadFile(room.room_code, docFile);
+            upsertFile(created);
+            useRoomStore.getState().adjustUsedStorage(created.file_size);
+            setWordEditingFile(created);
+            pushToast('success', `${created.original_name} siap diedit`, 3000);
+          } catch (err) {
+            pushToast(
+              'error',
+              err instanceof ApiError ? err.message : 'Gagal membuat dokumen Word'
+            );
+            throw err;
+          }
+        }}
       />
 
       <RenameFileModal

@@ -8,6 +8,7 @@ import {
   isEditableTextFile,
   isPreviewableFile,
   isValidRoomCode,
+  isWordDocumentFile,
   normalizeRoomCode,
 } from '@/utils/validators';
 
@@ -60,5 +61,11 @@ describe('validators and formatters', () => {
     expect(getMonacoLanguageForFile('app.ts', 'video/mp2t')).toBe('typescript');
     expect(getMonacoLanguageForFile('server.go', 'application/octet-stream')).toBe('go');
     expect(getMonacoLanguageForFile('README.txt', 'text/plain')).toBe('plaintext');
+  });
+
+  it('detects OOXML .docx Word files for preview and editing', () => {
+    expect(isWordDocumentFile('Laporan.docx', 'application/zip')).toBe(true);
+    expect(isWordDocumentFile('Laporan.pdf', 'application/pdf')).toBe(false);
+    expect(isPreviewableFile('application/zip', 'Laporan.docx')).toBe(true);
   });
 });

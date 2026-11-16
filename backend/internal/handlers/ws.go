@@ -80,6 +80,12 @@ func (h *WSHandler) ServeRoomWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := middleware.ClientIP(r)
+	if allowed, msg := h.hub.CanAcceptConnection(clientIP, room.ID, h.cfg.MaxWSPerIP, h.cfg.MaxWSPerRoom); !allowed {
+		middleware.WriteError(w, http.StatusTooManyRequests, "ws_limit_exceeded", msg)
+		return
+	}
+
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -110,6 +116,7 @@ func (h *WSHandler) ServeRoomWS(w http.ResponseWriter, r *http.Request) {
 		Send:     make(chan []byte, 64),
 		RoomID:   room.ID,
 		RoomCode: room.RoomCode,
+		ClientIP: clientIP,
 		Peer:     peer,
 	}
 

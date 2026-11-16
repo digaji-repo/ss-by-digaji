@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { MobileNavigation } from '@/components/layout/MobileNavigation';
+import { Dropdown } from '@/components/ui/DropdownAndPopover';
 import { Select } from '@/components/ui/FormControls';
 import { ThemeToggle } from '@/components/ui/ThemeToggle';
 import { FileList } from '@/features/files/components/FileList';
@@ -164,5 +165,63 @@ describe('DropRoom UI components', () => {
     expect(dialog.className).toContain('justify-center');
     expect(dialog.querySelector('.ios-modal-backdrop')).not.toBeNull();
     expect(screen.getByText('screenshot.png')).toBeInTheDocument();
+  });
+
+  it('portals Dropdown menu outside overflow containers to document.body', () => {
+    const onRename = vi.fn();
+    const { container } = render(
+      <div className="max-h-40 overflow-y-auto" data-testid="scroll-card">
+        <Dropdown
+          trigger={<button type="button">Opsi Lainnya</button>}
+          items={[
+            { id: 'rename', label: 'Ubah Nama File', onClick: onRename },
+            { id: 'delete', label: 'Hapus File', danger: true, onClick: vi.fn() },
+          ]}
+        />
+      </div>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Opsi Lainnya' }));
+    const menu = screen.getByRole('menu');
+    expect(container.contains(menu)).toBe(false);
+    expect(document.body.contains(menu)).toBe(true);
+    expect(menu.style.position).toBe('fixed');
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Ubah Nama File' }));
+    expect(onRename).toHaveBeenCalledTimes(1);
+  });
+
+  it('exposes Word editor action button for .docx files in FileList', () => {
+    const onEditWord = vi.fn();
+    render(
+      <FileList
+        files={[
+          {
+            id: 'docx-1',
+            room_id: 'r1',
+            original_name: 'Kontrak.docx',
+            mime_type:
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            file_size: 4096,
+            download_count: 0,
+            created_at: '2026-11-16T10:00:00Z',
+          },
+        ]}
+        loading={false}
+        onPreview={vi.fn()}
+        onEditContent={vi.fn()}
+        onEditWord={onEditWord}
+        onRename={vi.fn()}
+        onCopyLink={vi.fn()}
+        onDownload={vi.fn()}
+        onDelete={vi.fn()}
+        onBulkDelete={vi.fn()}
+      />
+    );
+
+    const wordBtn = screen.getByRole('button', { name: 'Edit Dokumen Word' });
+    fireEvent.click(wordBtn);
+    expect(onEditWord).toHaveBeenCalledTimes(1);
+    expect(onEditWord.mock.calls[0]?.[0]?.id).toBe('docx-1');
   });
 });

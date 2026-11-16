@@ -16,6 +16,7 @@ export class ApiError extends Error {
 }
 
 const TOKEN_STORAGE_PREFIX = 'droproom_token_';
+const inFlightRoomLookups = new Map<string, Promise<RoomInfo>>();
 
 export function saveRoomToken(code: string, token: string): void {
   try {
@@ -80,11 +81,22 @@ export const api = {
   },
 
   async getRoom(code: string): Promise<RoomInfo> {
-    const res = await fetch(`/api/rooms/${encodeURIComponent(code)}`, {
-      credentials: 'include',
-      headers: buildAuthHeaders(code),
+    const normKey = code.trim().toUpperCase();
+    const pending = inFlightRoomLookups.get(normKey);
+    if (pending) {
+      return pending;
+    }
+    const req = (async () => {
+      const res = await fetch(`/api/rooms/${encodeURIComponent(code)}`, {
+        credentials: 'include',
+        headers: buildAuthHeaders(code),
+      });
+      return parseJsonResponse<RoomInfo>(res);
+    })().finally(() => {
+      inFlightRoomLookups.delete(normKey);
     });
-    return parseJsonResponse<RoomInfo>(res);
+    inFlightRoomLookups.set(normKey, req);
+    return req;
   },
 
   async validateRoom(code: string, password?: string): Promise<RoomInfo> {
@@ -120,6 +132,23 @@ export const api = {
     });
     const data = await parseJsonResponse<{ files: FileItem[] }>(res);
     return data.files;
+  },
+
+  async uploadFile(code: string, file: File): Promise<FileItem> {
+    const form = new FormData();
+    form.append('files', file, file.name);
+    const res = await fetch(`/api/rooms/${encodeURIComponent(code)}/files`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: buildAuthHeaders(code),
+      body: form,
+    });
+    const data = await parseJsonResponse<{ files: FileItem[] }>(res);
+    const saved = data.files[0];
+    if (!saved) {
+      throw new ApiError(500, 'upload_empty', 'Gagal membuat file di room.');
+    }
+    return saved;
   },
 
   async deleteFile(fileId: string, roomCode: string): Promise<void> {
@@ -173,12 +202,42 @@ export const api = {
   async fetchFileTextContent(fileId: string, roomCode: string): Promise<string> {
     const res = await fetch(`/api/files/${encodeURIComponent(fileId)}/preview`, {
       credentials: 'include',
+      cache: 'no-store',
       headers: buildAuthHeaders(roomCode),
     });
     if (!res.ok) {
       throw new ApiError(res.status, 'preview_failed', 'Gagal membaca isi file.');
     }
     return res.text();
+  },
+
+  async fetchFileBinary(fileId: string, roomCode: string): Promise<ArrayBuffer> {
+    const res = await fetch(`/api/files/${encodeURIComponent(fileId)}/preview?_t=${Date.now()}`, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: buildAuthHeaders(roomCode),
+    });
+    if (!res.ok) {
+      throw new ApiError(res.status, 'preview_failed', 'Gagal memuat dokumen Word.');
+    }
+    return res.arrayBuffer();
+  },
+
+  async updateWordBinary(
+    fileId: string,
+    roomCode: string,
+    blob: Blob,
+    fileName: string
+  ): Promise<FileItem> {
+    const form = new FormData();
+    form.append('file', blob, fileName);
+    const res = await fetch(`/api/files/${encodeURIComponent(fileId)}/binary`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: buildAuthHeaders(roomCode),
+      body: form,
+    });
+    return parseJsonResponse<FileItem>(res);
   },
 
   async listPastes(code: string): Promise<PasteItem[]> {

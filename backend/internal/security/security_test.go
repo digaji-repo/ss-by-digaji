@@ -1,6 +1,13 @@
 package security
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -83,21 +90,112 @@ func TestSanitizeAndValidateFile(t *testing.T) {
 		t.Fatal("expected traversal-only filename to fail")
 	}
 
-	if _, err := ValidateExtensionAndDetectMIME("malware.exe", []byte("plain"), ""); err == nil {
-		t.Fatal("expected .exe to be blocked")
+	for _, disallowed := range []string{"malware.exe", "script.ps1", "macro.docm", "payload.bin", "unknown.xyz123"} {
+		if _, err := ValidateExtensionAndDetectMIME(disallowed, []byte("plain"), ""); !errors.Is(err, ErrBlockedExtension) {
+			t.Fatalf("expected ErrBlockedExtension for %q, got %v", disallowed, err)
+		}
 	}
-	if _, err := ValidateExtensionAndDetectMIME("script.ps1", []byte("Write-Host 1"), ""); err == nil {
-		t.Fatal("expected .ps1 to be blocked")
-	}
+
 	if _, err := ValidateExtensionAndDetectMIME("disguised.txt", []byte{'M', 'Z', 0x90, 0x00}, "text/plain"); err == nil {
 		t.Fatal("expected MZ PE header disguised as .txt to be blocked")
 	}
+	if _, err := ValidateExtensionAndDetectMIME("fake.pdf", []byte("<html>alert(1)</html>"), "application/pdf"); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("expected ErrInvalidSignature for fake.pdf, got %v", err)
+	}
+	if _, err := ValidateExtensionAndDetectMIME("fake.png", []byte("not-a-png"), "image/png"); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("expected ErrInvalidSignature for fake.png, got %v", err)
+	}
 
 	mimeType, err := ValidateExtensionAndDetectMIME("notes.json", []byte(`{"ok":true}`), "application/json")
-	if err != nil {
-		t.Fatalf("expected json to pass, got %v", err)
+	if err != nil || mimeType != "application/json" {
+		t.Fatalf("expected application/json, got %q err=%v", mimeType, err)
 	}
-	if mimeType != "application/json" {
-		t.Fatalf("expected application/json, got %q", mimeType)
+
+	docxMime, err := ValidateExtensionAndDetectMIME("report.docx", []byte{'P', 'K', 0x03, 0x04}, "application/octet-stream")
+	if err != nil || docxMime != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+		t.Fatalf("expected docx mime, got %q err=%v", docxMime, err)
+	}
+	if !IsWordDocumentFile("report.docx", docxMime) {
+		t.Fatal("expected IsWordDocumentFile to return true for .docx")
+	}
+	if IsPreviewableMIME("image/svg+xml") {
+		t.Fatal("expected image/svg+xml to be disallowed from inline preview")
+	}
+}
+
+func TestInspectOOXMLArchive(t *testing.T) {
+	tmpDir := t.TempDir()
+	validPath := filepath.Join(tmpDir, "valid.docx")
+	var validBuf bytes.Buffer
+	zw := zip.NewWriter(&validBuf)
+	w, _ := zw.Create("[Content_Types].xml")
+	_, _ = w.Write([]byte(`<Types></Types>`))
+	_ = zw.Close()
+	_ = os.WriteFile(validPath, validBuf.Bytes(), 0o600)
+
+	if err := InspectOOXMLArchive(validPath, 1024*1024, true); err != nil {
+		t.Fatalf("expected valid docx archive, got %v", err)
+	}
+
+	invalidPath := filepath.Join(tmpDir, "missing-types.docx")
+	var badBuf bytes.Buffer
+	zwBad := zip.NewWriter(&badBuf)
+	w2, _ := zwBad.Create("random.txt")
+	_, _ = w2.Write([]byte("not a docx"))
+	_ = zwBad.Close()
+	_ = os.WriteFile(invalidPath, badBuf.Bytes(), 0o600)
+
+	if err := InspectOOXMLArchive(invalidPath, 1024*1024, true); !errors.Is(err, ErrInvalidArchive) {
+		t.Fatalf("expected ErrInvalidArchive when missing [Content_Types].xml, got %v", err)
+	}
+}
+
+func TestClamAVScannerINSTREAM(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "sample.txt")
+	_ = os.WriteFile(tmpFile, []byte("hello world"), 0o600)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	reply := "stream: OK\x00"
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				for {
+					n, rErr := c.Read(buf)
+					if n > 0 && bytes.Contains(buf[:n], []byte{0, 0, 0, 0}) {
+						_, _ = c.Write([]byte(reply))
+						return
+					}
+					if rErr != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	scanner := NewClamAVScanner(ln.Addr().String(), 2*time.Second)
+	if err := scanner.ScanFile(context.Background(), tmpFile); err != nil {
+		t.Fatalf("expected clean scan result, got %v", err)
+	}
+
+	reply = "stream: Eicar-Signature FOUND\x00"
+	if err := scanner.ScanFile(context.Background(), tmpFile); !errors.Is(err, ErrMalwareDetected) {
+		t.Fatalf("expected ErrMalwareDetected, got %v", err)
+	}
+
+	downScanner := NewClamAVScanner("127.0.0.1:1", 200*time.Millisecond)
+	if err := downScanner.ScanFile(context.Background(), tmpFile); !errors.Is(err, ErrScannerUnavailable) {
+		t.Fatalf("expected ErrScannerUnavailable when clamd is offline, got %v", err)
 	}
 }

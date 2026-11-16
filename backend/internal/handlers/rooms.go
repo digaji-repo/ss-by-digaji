@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -235,6 +236,19 @@ func (h *RoomHandler) insertRoomTx(ctx context.Context, code string, createdAt, 
 	return room, nil
 }
 
+func (h *RoomHandler) writeRoomNotFoundOrRateLimited(w http.ResponseWriter, r *http.Request) {
+	if h.cache != nil && h.cfg != nil && h.cfg.RLRoomProbe404PerMin > 0 {
+		bucket := time.Now().UTC().Unix() / 60
+		probeKey := fmt.Sprintf("rl:probe404:%d:%s", bucket, middleware.ClientIP(r))
+		if allowed, _, retryAfter, rlErr := h.cache.AllowRateLimit(r.Context(), probeKey, h.cfg.RLRoomProbe404PerMin, time.Minute); rlErr == nil && !allowed {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retryAfter.Seconds())+1))
+			middleware.WriteError(w, http.StatusTooManyRequests, "rate_limited", "Terlalu banyak percobaan pencarian kode room. Silakan tunggu sebentar.")
+			return
+		}
+	}
+	middleware.WriteError(w, http.StatusNotFound, "room_not_found", "Room not found.")
+}
+
 // GetRoom handles GET /api/rooms/{code}.
 func (h *RoomHandler) GetRoom(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
@@ -245,7 +259,7 @@ func (h *RoomHandler) GetRoom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
-			middleware.WriteError(w, http.StatusNotFound, "room_not_found", "Room not found.")
+			h.writeRoomNotFoundOrRateLimited(w, r)
 			return
 		}
 		middleware.WriteError(w, http.StatusInternalServerError, "db_error", "Unable to look up room.")
@@ -298,7 +312,7 @@ func (h *RoomHandler) ValidateRoom(w http.ResponseWriter, r *http.Request) {
 	room, err := middleware.LoadRoomByCode(r.Context(), h.db, h.cache, normCode)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			middleware.WriteError(w, http.StatusNotFound, "room_not_found", "Room not found.")
+			h.writeRoomNotFoundOrRateLimited(w, r)
 			return
 		}
 		middleware.WriteError(w, http.StatusInternalServerError, "db_error", "Unable to validate room.")

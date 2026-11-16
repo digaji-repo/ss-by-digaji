@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"net/http"
+	"strings"
 
 	"github.com/droproom/backend/internal/cache"
 	"github.com/droproom/backend/internal/config"
@@ -12,7 +13,7 @@ import (
 	"github.com/droproom/backend/internal/storage"
 )
 
-// NewRouter constructs the HTTP + WebSocket router with security, CORS, and rate limiting middlewares.
+// NewRouter constructs the HTTP + WebSocket router with security, CORS, concurrency, and granular rate limiting middlewares.
 func NewRouter(
 	db *sql.DB,
 	cacheClient *cache.Client,
@@ -32,25 +33,40 @@ func NewRouter(
 		return r.PathValue("code")
 	})
 
+	roomKey := func(r *http.Request) string {
+		return strings.ToUpper(strings.TrimSpace(r.PathValue("code")))
+	}
+
+	rlCreate := middleware.EndpointRateLimit(cacheClient, "create", cfg.RLCreateRoomPerMin, middleware.ClientIP)
+	rlJoin := middleware.EndpointRateLimit(cacheClient, "join", cfg.RLJoinRoomPerMin, middleware.ClientIP)
+	rlValidateRoom := middleware.EndpointRateLimit(cacheClient, "pw_room", cfg.RLValidatePWPerMinRoom, roomKey)
+	rlWS := middleware.EndpointRateLimit(cacheClient, "ws", cfg.RLWSHandshakePerMin, middleware.ClientIP)
+
+	uploadLimiter := middleware.NewConcurrencyLimiter()
+	downloadLimiter := middleware.NewConcurrencyLimiter()
+	upConc := uploadLimiter.Limit(cfg.MaxConcurrentUploadsPerIP, middleware.ClientIP)
+	dlConc := downloadLimiter.Limit(cfg.MaxConcurrentDownloadsPerIP, middleware.ClientIP)
+
 	// Health & Room lifecycle
 	mux.HandleFunc("GET /api/health", healthH.Check)
-	mux.HandleFunc("POST /api/rooms", roomH.CreateRoom)
-	mux.HandleFunc("GET /api/rooms/{code}", roomH.GetRoom)
-	mux.HandleFunc("POST /api/rooms/{code}/validate", roomH.ValidateRoom)
+	mux.Handle("POST /api/rooms", rlCreate(http.HandlerFunc(roomH.CreateRoom)))
+	mux.Handle("GET /api/rooms/{code}", rlJoin(http.HandlerFunc(roomH.GetRoom)))
+	mux.Handle("POST /api/rooms/{code}/validate", rlValidateRoom(http.HandlerFunc(roomH.ValidateRoom)))
 	mux.Handle("GET /api/rooms/{code}/events", roomGuard(http.HandlerFunc(roomH.ListEvents)))
 
-	// File sharing (streaming + chunked resumable + bulk delete + download + preview + rename/edit + delete)
-	mux.Handle("POST /api/rooms/{code}/files", roomGuard(http.HandlerFunc(fileH.UploadFiles)))
+	// File sharing (quarantine + ClamAV + concurrency + bandwidth caps)
+	mux.Handle("POST /api/rooms/{code}/files", upConc(roomGuard(http.HandlerFunc(fileH.UploadFiles))))
 	mux.Handle("POST /api/rooms/{code}/files/bulk-delete", roomGuard(http.HandlerFunc(fileH.BulkDeleteFiles)))
-	mux.Handle("POST /api/rooms/{code}/files/chunked/init", roomGuard(http.HandlerFunc(fileH.InitChunkedUpload)))
+	mux.Handle("POST /api/rooms/{code}/files/chunked/init", upConc(roomGuard(http.HandlerFunc(fileH.InitChunkedUpload))))
 	mux.Handle("GET /api/rooms/{code}/files/chunked/{uploadId}", roomGuard(http.HandlerFunc(fileH.GetChunkedStatus)))
-	mux.Handle("PUT /api/rooms/{code}/files/chunked/{uploadId}/chunks/{index}", roomGuard(http.HandlerFunc(fileH.UploadChunkPart)))
-	mux.Handle("POST /api/rooms/{code}/files/chunked/{uploadId}/complete", roomGuard(http.HandlerFunc(fileH.CompleteChunkedUpload)))
+	mux.Handle("PUT /api/rooms/{code}/files/chunked/{uploadId}/chunks/{index}", upConc(roomGuard(http.HandlerFunc(fileH.UploadChunkPart))))
+	mux.Handle("POST /api/rooms/{code}/files/chunked/{uploadId}/complete", upConc(roomGuard(http.HandlerFunc(fileH.CompleteChunkedUpload))))
 	mux.Handle("GET /api/rooms/{code}/files", roomGuard(http.HandlerFunc(fileH.ListFiles)))
-	mux.HandleFunc("GET /api/files/{id}/download", fileH.DownloadFile)
-	mux.HandleFunc("GET /api/files/{id}/preview", fileH.PreviewFile)
+	mux.Handle("GET /api/files/{id}/download", dlConc(http.HandlerFunc(fileH.DownloadFile)))
+	mux.Handle("GET /api/files/{id}/preview", dlConc(http.HandlerFunc(fileH.PreviewFile)))
 	mux.HandleFunc("PUT /api/files/{id}", fileH.RenameFile)
 	mux.HandleFunc("PUT /api/files/{id}/content", fileH.UpdateFileContent)
+	mux.Handle("PUT /api/files/{id}/binary", upConc(http.HandlerFunc(fileH.UpdateWordBinary)))
 	mux.HandleFunc("DELETE /api/files/{id}", fileH.DeleteFile)
 
 	// Paste sharing
@@ -60,7 +76,7 @@ func NewRouter(
 	mux.HandleFunc("DELETE /api/pastes/{id}", pasteH.DeletePaste)
 
 	// WebSocket gateway
-	mux.HandleFunc("GET /ws/rooms/{code}", wsH.ServeRoomWS)
+	mux.Handle("GET /ws/rooms/{code}", rlWS(http.HandlerFunc(wsH.ServeRoomWS)))
 
 	var handler http.Handler = mux
 	handler = middleware.RateLimit(cacheClient, cfg.RateLimitRequestsPerMinute)(handler)

@@ -26,6 +26,7 @@ type Client struct {
 	Send     chan []byte
 	RoomID   string
 	RoomCode string
+	ClientIP string
 	Peer     models.PeerPresence
 }
 
@@ -36,16 +37,18 @@ type roomSub struct {
 
 // Hub manages WebSocket clients per room and bridges broadcasts through Redis Pub/Sub.
 type Hub struct {
-	cache *cache.Client
-	mu    sync.RWMutex
-	rooms map[string]*roomSub
+	cache    *cache.Client
+	mu       sync.RWMutex
+	rooms    map[string]*roomSub
+	ipCounts map[string]int
 }
 
 // NewHub constructs a Hub backed by Redis Pub/Sub for multi-instance event synchronization.
 func NewHub(cacheClient *cache.Client) *Hub {
 	return &Hub{
-		cache: cacheClient,
-		rooms: make(map[string]*roomSub),
+		cache:    cacheClient,
+		rooms:    make(map[string]*roomSub),
+		ipCounts: make(map[string]int),
 	}
 }
 
@@ -66,6 +69,21 @@ func (h *Hub) Publish(ctx context.Context, env Envelope) {
 	h.broadcastLocal(env.RoomID, raw)
 }
 
+// CanAcceptConnection checks whether ip and roomID are under configured WebSocket concurrency limits.
+func (h *Hub) CanAcceptConnection(ip, roomID string, maxPerIP, maxPerRoom int) (bool, string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if maxPerIP > 0 && ip != "" && h.ipCounts[ip] >= maxPerIP {
+		return false, "Too many active WebSocket connections from your IP."
+	}
+	if maxPerRoom > 0 {
+		if sub, ok := h.rooms[roomID]; ok && len(sub.clients) >= maxPerRoom {
+			return false, "This room has reached the maximum number of active connections."
+		}
+	}
+	return true, ""
+}
+
 // Register attaches a WebSocket client to its room and starts a Redis Pub/Sub listener if needed.
 func (h *Hub) Register(c *Client) {
 	h.mu.Lock()
@@ -80,6 +98,9 @@ func (h *Hub) Register(c *Client) {
 		go h.listenRedisRoom(subCtx, c.RoomID)
 	}
 	sub.clients[c] = struct{}{}
+	if c.ClientIP != "" {
+		h.ipCounts[c.ClientIP]++
+	}
 	h.mu.Unlock()
 
 	if h.cache != nil {
@@ -95,6 +116,13 @@ func (h *Hub) Unregister(c *Client) {
 		if _, exists := sub.clients[c]; exists {
 			delete(sub.clients, c)
 			close(c.Send)
+			if c.ClientIP != "" {
+				if cur := h.ipCounts[c.ClientIP] - 1; cur <= 0 {
+					delete(h.ipCounts, c.ClientIP)
+				} else {
+					h.ipCounts[c.ClientIP] = cur
+				}
+			}
 		}
 		if len(sub.clients) == 0 {
 			sub.cancel()

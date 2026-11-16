@@ -98,6 +98,18 @@ export function getFileExtension(fileName: string): string {
   return parts.pop() ?? '';
 }
 
+export const WORD_DOCX_MIME =
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+export function isWordDocumentFile(fileName: string, mimeType = ''): boolean {
+  const ext = getFileExtension(fileName);
+  if (ext === 'docx') {
+    return true;
+  }
+  const base = mimeType.split(';')[0]?.trim().toLowerCase() ?? '';
+  return base === WORD_DOCX_MIME;
+}
+
 export function isEditableTextFile(fileName: string, mimeType: string): boolean {
   const ext = getFileExtension(fileName);
   if (ext && Object.prototype.hasOwnProperty.call(EXT_TO_MONACO_LANG, ext)) {
@@ -129,7 +141,10 @@ export function getMonacoLanguageForFile(fileName: string, mimeType: string): st
 }
 
 export function isPreviewableFile(mimeType: string, fileName = ''): boolean {
-  if (fileName && isEditableTextFile(fileName, mimeType)) {
+  if (fileName && (isEditableTextFile(fileName, mimeType) || isWordDocumentFile(fileName, mimeType))) {
+    return true;
+  }
+  if (isWordDocumentFile(fileName, mimeType)) {
     return true;
   }
   const base = mimeType.split(';')[0]?.trim().toLowerCase() ?? '';

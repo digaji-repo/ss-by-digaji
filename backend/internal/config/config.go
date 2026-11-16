@@ -33,8 +33,24 @@ type Config struct {
 	ExpiredTombstoneRetention  time.Duration
 	ChunkUploadTTL             time.Duration
 	RateLimitRequestsPerMinute int
+	RLCreateRoomPerMin          int
+	RLJoinRoomPerMin            int
+	RLRoomProbe404PerMin        int
+	RLValidatePWPerMinRoom      int
+	RLWSHandshakePerMin        int
+	MaxConcurrentUploadsPerIP  int
+	MaxConcurrentDownloadsPerIP int
+	DownloadBandwidthKBps      int64
+	MaxWSPerIP                 int
+	MaxWSPerRoom               int
 	PasswordMaxAttempts        int
 	PasswordLockoutDuration    time.Duration
+	ClamAVEnabled              bool
+	ClamAVAddr                 string
+	ClamAVTimeout              time.Duration
+	ClamAVFailOpen             bool
+	MaxPreviewBytes            int64
+	MaxDocxUncompressedBytes   int64
 }
 
 // Load reads configuration from optional .env files and environment variables.
@@ -63,9 +79,25 @@ func Load() *Config {
 		ExpiringWarningWindow:      time.Duration(getEnvInt("EXPIRING_WARNING_MINUTES", 5)) * time.Minute,
 		ExpiredTombstoneRetention:  time.Duration(getEnvInt("EXPIRED_TOMBSTONE_RETENTION_HOURS", 24)) * time.Hour,
 		ChunkUploadTTL:             time.Duration(getEnvInt("CHUNK_UPLOAD_TTL_HOURS", 2)) * time.Hour,
-		RateLimitRequestsPerMinute: getEnvInt("RATE_LIMIT_REQUESTS_PER_MIN", 120),
-		PasswordMaxAttempts:        getEnvInt("PASSWORD_MAX_ATTEMPTS", 5),
-		PasswordLockoutDuration:    time.Duration(getEnvInt("PASSWORD_LOCKOUT_SECONDS", 300)) * time.Second,
+		RateLimitRequestsPerMinute:  getEnvInt("RATE_LIMIT_REQUESTS_PER_MIN", 120),
+		RLCreateRoomPerMin:          getEnvInt("RL_CREATE_ROOM_PER_MIN", 5),
+		RLJoinRoomPerMin:            getEnvInt("RL_JOIN_ROOM_PER_MIN", 60),
+		RLRoomProbe404PerMin:        getEnvInt("RL_ROOM_PROBE_404_PER_MIN", 15),
+		RLValidatePWPerMinRoom:      getEnvInt("RL_VALIDATE_PW_PER_MIN_ROOM", 30),
+		RLWSHandshakePerMin:         getEnvInt("RL_WS_HANDSHAKE_PER_MIN", 15),
+		MaxConcurrentUploadsPerIP:   getEnvInt("MAX_CONCURRENT_UPLOADS_PER_IP", 5),
+		MaxConcurrentDownloadsPerIP: getEnvInt("MAX_CONCURRENT_DOWNLOADS_PER_IP", 4),
+		DownloadBandwidthKBps:       getEnvInt64("DOWNLOAD_BANDWIDTH_KBPS", 0),
+		MaxWSPerIP:                  getEnvInt("MAX_WS_PER_IP", 5),
+		MaxWSPerRoom:                getEnvInt("MAX_WS_PER_ROOM", 50),
+		PasswordMaxAttempts:         getEnvInt("PASSWORD_MAX_ATTEMPTS", 5),
+		PasswordLockoutDuration:     time.Duration(getEnvInt("PASSWORD_LOCKOUT_SECONDS", 300)) * time.Second,
+		ClamAVEnabled:               getEnvBool("CLAMAV_ENABLED", false),
+		ClamAVAddr:                  getEnv("CLAMAV_ADDR", "127.0.0.1:3310"),
+		ClamAVTimeout:               time.Duration(getEnvInt("CLAMAV_TIMEOUT_SECONDS", 30)) * time.Second,
+		ClamAVFailOpen:              getEnvBool("CLAMAV_FAIL_OPEN", false),
+		MaxPreviewBytes:             getEnvInt64("MAX_PREVIEW_BYTES", 25*1024*1024),
+		MaxDocxUncompressedBytes:    getEnvInt64("MAX_DOCX_UNCOMPRESSED_BYTES", 30*1024*1024),
 	}
 }
 
