@@ -1,0 +1,150 @@
+name: DropRoom CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: droproom-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-frontend:
+    name: Frontend Typecheck, Test & Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run Vitest suite
+        run: npm test
+
+      - name: Build production bundle
+        run: npm run build
+
+  ci-backend:
+    name: Backend Go Test & Build
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci_root_password
+          MYSQL_DATABASE: droproom_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -pci_root_password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: '3306'
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ci_root_password
+      MYSQL_DATABASE: droproom_test
+      TEST_MYSQL_DATABASE: droproom_test
+      REDIS_ADDR: 127.0.0.1:6379
+      REDIS_PASSWORD: ''
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: backend/go.sum
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Run Go unit & integration tests
+        run: go test -count=1 -v ./...
+
+      - name: Build Go server binary
+        run: CGO_ENABLED=0 GOOS=linux go build -o ./bin/droproom-server ./cmd/server
+
+  deploy-production:
+    name: Deploy to ss.digaji.id
+    needs: [ci-frontend, ci-backend]
+    if: github.ref == 'refs/heads/main' && vars.AUTO_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH & Deploy via Docker Compose
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ] || [ -z "$VPS_SSH_KEY" ] || [ -z "$VPS_APP_DIR" ]; then
+            echo "Missing required secrets (VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_APP_DIR)."
+            exit 1
+          fi
+
+          PORT="${VPS_PORT:-22}"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/deploy_key -p "$PORT" "$VPS_USER@$VPS_HOST" "bash -s" <<EOF
+            set -euo pipefail
+            cd "$VPS_APP_DIR"
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up -d --build --remove-orphans
+            for i in \$(seq 1 20); do
+              if docker compose exec -T web wget -qO- http://127.0.0.1/api/health >/dev/null 2>&1; then
+                echo "Health check passed!"
+                docker image prune -f
+                exit 0
+              fi
+              echo "Waiting for backend health check (\$i/20)..."
+              sleep 3
+            done
+            echo "Health check timed out."
+            docker compose logs --tail=40 backend
+            exit 1
+          EOF
