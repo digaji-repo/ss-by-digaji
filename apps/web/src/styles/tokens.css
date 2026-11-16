@@ -1,0 +1,20 @@
+:root {
+  /* Color Identity (ui.md §2.1) */
+  --color-primary: #0A84FF;
+  --color-primary-dark: #0066CC;
+  --color-accent: #30D5A0;
+  --color-danger: #FF453A;
+  --color-warning: #FF9F0A;
+
+  /* Spacing & Radii (ui.md §5) */
+  --radius-btn-sm: 8px;
+  --radius-input: 9px;
+  --radius-card: 12px;
+  --radius-modal: 16px;
+  --radius-floating: 18px;
+  --radius-workspace: 16px;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}

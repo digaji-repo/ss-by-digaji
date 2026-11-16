@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+/storage/
+/backend/bin/
+/backend/storage/
+/apps/web/node_modules/
+/apps/web/dist/
+*.tsbuildinfo
+*.log
+dump.rdb
+.DS_Store
+Thumbs.db

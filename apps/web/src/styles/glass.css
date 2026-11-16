@@ -1,0 +1,55 @@
+/* iOS Liquid Glass Surface Hierarchy */
+.glass-light {
+  background: var(--glass-light-bg);
+  backdrop-filter: blur(18px) saturate(155%);
+  -webkit-backdrop-filter: blur(18px) saturate(155%);
+  border: 1px solid var(--glass-light-border);
+  box-shadow: var(--glass-shadow);
+  transition: background-color 260ms ease, border-color 240ms ease, box-shadow 260ms ease;
+}
+
+.glass-medium,
+.glass-panel {
+  background: var(--glass-medium-bg);
+  backdrop-filter: blur(24px) saturate(165%);
+  -webkit-backdrop-filter: blur(24px) saturate(165%);
+  border: 1px solid var(--glass-medium-border);
+  box-shadow: var(--glass-shadow);
+  transition: background-color 260ms ease, border-color 240ms ease, box-shadow 260ms ease;
+}
+
+.glass-strong {
+  background: var(--glass-strong-bg);
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  border: 1px solid var(--glass-strong-border);
+  box-shadow: var(--glass-shadow-strong);
+  transition: background-color 260ms ease, border-color 240ms ease, box-shadow 260ms ease;
+}
+
+.glass-pill-dock {
+  background: var(--pill-dock-bg);
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  border: 1px solid var(--glass-strong-border);
+  box-shadow: var(--glass-shadow-strong);
+  transition: background-color 260ms ease, border-color 240ms ease, box-shadow 260ms ease;
+}
+
+.app-ambient-canvas {
+  position: relative;
+  overflow-x: hidden;
+  background: linear-gradient(145deg, #F4F8FF 0%, #E7F1FD 50%, #ECF7FA 100%);
+  transition: background 320ms ease;
+}
+
+[data-theme='dark'] .app-ambient-canvas {
+  background: radial-gradient(circle at 50% 0%, #101319 0%, #060709 55%, #040507 100%);
+}
+
+/* Smooth iOS Frosted Modal Backdrop */
+.ios-modal-backdrop {
+  background: var(--backdrop-overlay);
+  backdrop-filter: blur(22px) saturate(165%);
+  -webkit-backdrop-filter: blur(22px) saturate(165%);
+}
